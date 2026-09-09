@@ -112,7 +112,7 @@ credential setup (`create-registry`) entirely.
 
 | Var | Required | Default | Purpose |
 |---|---|---|---|
-| `TS_AUTHKEY` | Yes | — (fails fast if unset) | Fresh ephemeral Tailscale auth key, generated per run |
+| `TS_AUTHKEY` | Yes* | — (fails fast if unset) | Fresh ephemeral Tailscale auth key, generated per run. *Falls back to the RunPod secret `RUNPOD_SECRET_TSAUTH_KEY` if `TS_AUTHKEY` itself isn't set — lets the key be injected via RunPod's own secrets mechanism instead of a plaintext pod env var |
 | `TS_HOSTNAME` | No | `ollama-5090` | Fixed tailnet hostname / MagicDNS name |
 | `OLLAMA_MODEL` | No | `hf.co/unsloth/Qwen3.5-27B-GGUF:UD-Q6_K_XL` | Full pull string passed to `ollama pull` — not just a short name, so any HF GGUF repo/tag can be swapped in without touching the Dockerfile |
 | `OLLAMA_CONTEXT_LENGTH` | No | `16384` | Context window; see VRAM rationale above before raising |
@@ -142,6 +142,20 @@ package visibility to Public, matching the "public image" decision above.
   published image) caught a real bug before it could burn the ephemeral key —
   see "Bugs found" below. Auth key was not consumed since the script failed
   before reaching `tailscale up`.
+- 2026-09-09: second attempt, with the readiness-check fix
+  (`ghcr.io/surejaj/ollama-tailscale:sha-efab8cc`), got much further:
+  `tailscaled` came up correctly, `tailscale up` **succeeded** with the real
+  key, `ollama serve` started, and `ollama pull` downloaded the main 25GB
+  model blob completely. It then hit a transient HuggingFace timeout
+  (`context deadline exceeded`) fetching a small ~931MB secondary blob —
+  external flakiness, not an entrypoint bug — and exited via the fail-fast
+  path as designed. A `restart` (which preserves container disk, so the
+  already-downloaded 25GB blob and Tailscale state would carry over) was
+  attempted to resume the pull, but by then the ephemeral authkey had
+  expired, so `tailscale up` failed on the retry and the pod ended.
+  **`tailscale serve` and the final ready state have still not been
+  observed** — everything up to a completed model pull is confirmed working,
+  but the last step (exposing over the tailnet) remains unverified end-to-end.
 
 ## Bugs found in testing
 
@@ -182,13 +196,12 @@ without a registry credential.
 
 ## Not yet done
 
-- Push the entrypoint fix to `main` (needs a human — this session's git push
-  hit an SSH auth issue and the user opted to push manually) so CI rebuilds
-  the GHCR image with the readiness-check fix
 - Confirm the GHCR package visibility is set to Public (see note above — not automatic)
-- Re-run the full end-to-end test with a fresh `TS_AUTHKEY` once the fixed
-  image is published — this has not yet succeeded through to a working
-  `tailscale serve` endpoint
+- Re-run the full end-to-end test with a **fresh** `TS_AUTHKEY` — the previous
+  key expired mid-test after a transient HF download timeout forced a retry
+  (see Verified log above). Everything through a completed model pull is
+  confirmed; `tailscale serve` and the final ready state are still unverified
 - Get RTX 5090 stock in a volume-compatible DC (US-GA-2 / EU-RO-1 / EUR-IS-1)
   to validate the persistent-volume path specifically, separate from the
-  general entrypoint validation above
+  general entrypoint validation above — the 50GB volume (`a0szef22qu`) already
+  exists in US-GA-2 but has never been used in a successful deploy

@@ -1,7 +1,8 @@
 #!/bin/bash
 set -euo pipefail
 
-: "${TS_AUTHKEY:?TS_AUTHKEY is required — generate a fresh ephemeral key each run}"
+TS_AUTHKEY="${TS_AUTHKEY:-${RUNPOD_SECRET_TSAUTH_KEY:-}}"
+: "${TS_AUTHKEY:?TS_AUTHKEY (or RunPod secret TSAUTH_KEY) is required — generate a fresh ephemeral key each run}"
 TS_HOSTNAME="${TS_HOSTNAME:-ollama-5090}"
 OLLAMA_MODEL="${OLLAMA_MODEL:-hf.co/unsloth/Qwen3.5-27B-GGUF:UD-Q6_K_XL}"
 OLLAMA_CONTEXT_LENGTH="${OLLAMA_CONTEXT_LENGTH:-16384}"
