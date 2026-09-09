@@ -123,6 +123,15 @@ credential setup (`create-registry`) entirely.
 - `entrypoint.sh` — orchestrates: `tailscaled` (userspace) → `tailscale up --ssh` →
   `ollama serve` → `ollama pull $OLLAMA_MODEL` → `tailscale serve` → `wait` on
   the Ollama process
+- `.github/workflows/docker-publish.yml` — builds and pushes to GHCR on every
+  push to `main` that touches the Dockerfile/entrypoint (or manual dispatch),
+  tagging `latest` + short commit SHA
+
+**Manual one-time step after the first workflow run:** GHCR packages pushed via
+the workflow's `GITHUB_TOKEN` default to **private** — the token can't change
+package visibility itself. Go to the repo's Packages tab (or
+`github.com/users/<owner>/packages/container/<repo>/settings`) and set the
+package visibility to Public, matching the "public image" decision above.
 
 ## Verified
 
@@ -132,7 +141,8 @@ credential setup (`create-registry`) entirely.
 
 ## Not yet done
 
-- Build and push the image to GHCR
+- Push to `main` (or run the workflow manually) to trigger the first GHCR build
+- Set the GHCR package visibility to Public (see note above — not automatic)
 - Create the actual network volume in US-GA-2
 - End-to-end `create-pod` run of the finished image (only the base image + pull
   step have been live-tested so far, not the full entrypoint with Tailscale)
