@@ -139,10 +139,16 @@ package visibility to Public, matching the "public image" decision above.
   working on a live RunPod RTX 5090 pod (Community Cloud, `ollama/ollama:latest`
   base image).
 
+## Image
+
+Published: `ghcr.io/surejaj/ollama-tailscale:sha-6862842` (also tagged `latest`
+on `main`). Confirm visibility is set to Public (see note above) before relying
+on pulling it without a registry credential.
+
 ## Not yet done
 
-- Push to `main` (or run the workflow manually) to trigger the first GHCR build
-- Set the GHCR package visibility to Public (see note above — not automatic)
+- Confirm the GHCR package visibility is set to Public (see note above — not automatic)
 - Create the actual network volume in US-GA-2
-- End-to-end `create-pod` run of the finished image (only the base image + pull
-  step have been live-tested so far, not the full entrypoint with Tailscale)
+- End-to-end `create-pod` run of the finished image with a real `TS_AUTHKEY` —
+  only the base `ollama/ollama:latest` image + HF pull step have been
+  live-tested so far, not the full entrypoint with Tailscale up/serve/ssh
