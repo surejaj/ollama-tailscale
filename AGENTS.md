@@ -188,40 +188,42 @@ but has not yet been used in a successful deploy, since US-GA-2 had no RTX
 
 ## Image
 
-Published: `ghcr.io/surejaj/ollama-tailscale:sha-6862842` (also tagged `latest`
-on `main`) — **contains the `tailscale status` readiness bug above**, fixed in
-the entrypoint locally but not yet rebuilt/pushed as of this note. Confirm
-visibility is set to Public (see note above) before relying on pulling it
-without a registry credential.
+Current: `ghcr.io/surejaj/ollama-tailscale:sha-13dc1e3` (also tagged `latest`
+on `main`) — includes the readiness-check fix and the (currently-dead-code)
+RunPod-secret fallback. Confirm GHCR visibility is set to Public (see note
+above) before relying on pulling it without a registry credential.
 
-## RunPod secrets — not resolved via the REST API (yet)
+## RunPod secrets — confirmed NOT usable via the REST API
 
-Tried getting the Tailscale authkey into the container via a RunPod account
-secret instead of a plaintext env var, two ways, both failed:
+Per RunPod's docs (docs.runpod.io/pods/templates/secrets), the templating
+syntax `{{ RUNPOD_SECRET_<name> }}` in an env var value is how you reference
+an account secret — but that page only documents it for the web console.
+Tried three ways to get the Tailscale authkey in via the account secret
+`TSAUTH_KEY` instead of a plaintext env var; all three failed on live pods:
 
 1. Assuming account secrets auto-inject as `RUNPOD_SECRET_<NAME>` env vars
    into every pod automatically: **false** — the pod crash-looped with
    `entrypoint.sh`'s "required" error every ~15-20s (RunPod auto-restarts a
    pod whose container exits), meaning the env var was never present at all.
-2. Passing `env: {"TS_AUTHKEY": "{{ RUNPOD_SECRET_TSAUTH_KEY }}"}` in the
-   `create-pod` body, assuming the API resolves that templating syntax:
-   **also false** — `tailscale up` actually ran with that literal string (or
-   something equally invalid) and Tailscale's control server rejected it
-   with "invalid key: unable to validate API key." The template substitution
-   is most likely a RunPod **web console** feature (picking a secret from a
-   dropdown when building a pod there), not something the REST API resolves
-   from a literal string.
+2. Passing `env: {"TS_AUTHKEY": "{{ RUNPOD_SECRET_TSAUTH_KEY }}"}` directly
+   in an ad-hoc `create-pod` body: **false** — `tailscale up` ran with that
+   literal/unresolved value and Tailscale's control server rejected it with
+   "invalid key: unable to validate API key."
+3. Same env value, but defined on a saved Template (`create-template`) and
+   launched via `templateId` instead of ad-hoc, on the theory the docs'
+   "environment variables section of templates" phrasing meant it only
+   resolves for template-defined env vars: **also false** — identical
+   "invalid key: unable to validate API key" error.
 
-Until this is figured out (or the user confirms the right API-level syntax),
-`TS_AUTHKEY` needs to be passed as its actual plain value in `env` on every
-`create-pod` call — the `RUNPOD_SECRET_TSAUTH_KEY` fallback in `entrypoint.sh`
-is harmless dead code until then, not a working feature.
+Conclusion: this templating syntax is web-console-only as of this test; the
+REST API (`create-pod`/`create-template`) does not resolve it under any
+combination tried. `TS_AUTHKEY` must be passed as its actual plain value in
+`env` on every `create-pod` call. The `RUNPOD_SECRET_TSAUTH_KEY` fallback
+left in `entrypoint.sh` is harmless (matches the docs' naming convention in
+case the API adds support later) but is dead code today — don't rely on it.
 
 ## Not yet done
 
-- Figure out the correct way to get a RunPod secret into a pod's env via the
-  REST API (see "RunPod secrets" above), or drop the fallback if it turns out
-  this genuinely requires the web console
 - Confirm the GHCR package visibility is set to Public (see note above — not automatic)
 - Re-run the full end-to-end test with a **fresh** `TS_AUTHKEY` — the previous
   key expired mid-test after a transient HF download timeout forced a retry
