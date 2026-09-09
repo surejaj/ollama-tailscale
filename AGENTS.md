@@ -112,7 +112,7 @@ credential setup (`create-registry`) entirely.
 
 | Var | Required | Default | Purpose |
 |---|---|---|---|
-| `TS_AUTHKEY` | Yes* | — (fails fast if unset) | Fresh ephemeral Tailscale auth key, generated per run. *Falls back to the RunPod secret `RUNPOD_SECRET_TSAUTH_KEY` if `TS_AUTHKEY` itself isn't set — lets the key be injected via RunPod's own secrets mechanism instead of a plaintext pod env var |
+| `TS_AUTHKEY` | Yes* | — (fails fast if unset) | Fresh ephemeral Tailscale auth key, generated per run. *Falls back to reading `RUNPOD_SECRET_TSAUTH_KEY` if `TS_AUTHKEY` itself isn't set in-container — but getting a RunPod account secret into either var via the REST `create-pod` API has NOT been made to work yet (see "RunPod secrets" below); as of now `TS_AUTHKEY` must be passed as a plain value via `env` |
 | `TS_HOSTNAME` | No | `ollama-5090` | Fixed tailnet hostname / MagicDNS name |
 | `OLLAMA_MODEL` | No | `hf.co/unsloth/Qwen3.5-27B-GGUF:UD-Q6_K_XL` | Full pull string passed to `ollama pull` — not just a short name, so any HF GGUF repo/tag can be swapped in without touching the Dockerfile |
 | `OLLAMA_CONTEXT_LENGTH` | No | `16384` | Context window; see VRAM rationale above before raising |
@@ -194,8 +194,34 @@ the entrypoint locally but not yet rebuilt/pushed as of this note. Confirm
 visibility is set to Public (see note above) before relying on pulling it
 without a registry credential.
 
+## RunPod secrets — not resolved via the REST API (yet)
+
+Tried getting the Tailscale authkey into the container via a RunPod account
+secret instead of a plaintext env var, two ways, both failed:
+
+1. Assuming account secrets auto-inject as `RUNPOD_SECRET_<NAME>` env vars
+   into every pod automatically: **false** — the pod crash-looped with
+   `entrypoint.sh`'s "required" error every ~15-20s (RunPod auto-restarts a
+   pod whose container exits), meaning the env var was never present at all.
+2. Passing `env: {"TS_AUTHKEY": "{{ RUNPOD_SECRET_TSAUTH_KEY }}"}` in the
+   `create-pod` body, assuming the API resolves that templating syntax:
+   **also false** — `tailscale up` actually ran with that literal string (or
+   something equally invalid) and Tailscale's control server rejected it
+   with "invalid key: unable to validate API key." The template substitution
+   is most likely a RunPod **web console** feature (picking a secret from a
+   dropdown when building a pod there), not something the REST API resolves
+   from a literal string.
+
+Until this is figured out (or the user confirms the right API-level syntax),
+`TS_AUTHKEY` needs to be passed as its actual plain value in `env` on every
+`create-pod` call — the `RUNPOD_SECRET_TSAUTH_KEY` fallback in `entrypoint.sh`
+is harmless dead code until then, not a working feature.
+
 ## Not yet done
 
+- Figure out the correct way to get a RunPod secret into a pod's env via the
+  REST API (see "RunPod secrets" above), or drop the fallback if it turns out
+  this genuinely requires the web console
 - Confirm the GHCR package visibility is set to Public (see note above — not automatic)
 - Re-run the full end-to-end test with a **fresh** `TS_AUTHKEY` — the previous
   key expired mid-test after a transient HF download timeout forced a retry
