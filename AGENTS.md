@@ -138,17 +138,57 @@ package visibility to Public, matching the "public image" decision above.
 - 2026-09-09: `ollama pull hf.co/unsloth/Qwen3.5-27B-GGUF:UD-Q6_K_XL` confirmed
   working on a live RunPod RTX 5090 pod (Community Cloud, `ollama/ollama:latest`
   base image).
+- 2026-09-09: first full-entrypoint end-to-end attempt (real `TS_AUTHKEY`,
+  published image) caught a real bug before it could burn the ephemeral key —
+  see "Bugs found" below. Auth key was not consumed since the script failed
+  before reaching `tailscale up`.
+
+## Bugs found in testing
+
+**Readiness check used `tailscale status`, which fails while logged out.**
+`tailscale status` intentionally exits non-zero in the `NeedsLogin` state — it
+answers "are we connected to the tailnet", not "is the daemon process up". The
+entrypoint used it to detect "is `tailscaled` ready for `tailscale up`", so it
+always timed out and exited before ever attempting authentication, even though
+the daemon was healthy. Fixed by checking for the daemon's Unix socket file
+(`/var/run/tailscale/tailscaled.sock`) existing instead — that appears as soon
+as `tailscaled` binds it, well before login state is relevant.
+
+## Live capacity constraints discovered during testing
+
+RTX 5090 stock is scarce enough (LOW everywhere, frequently zero in practice)
+that `create-pod` calls pinned to a specific data center often fail with "no
+instances available," even when the catalog lists that DC as having stock —
+the catalog label lags real-time availability. Calls with **no**
+`dataCenterIds` succeed far more often (the scheduler can place anywhere), but
+that's incompatible with attaching a network volume, since volumes are
+DC-pinned and a mount can't be added to a pod after creation. In practice this
+means: persistence (network volume) and "deploy right now" are sometimes in
+tension — when the volume-compatible DCs (US-GA-2 / EU-RO-1 / EUR-IS-1 at last
+check) have no 5090 stock, either wait/retry those DCs, or run without the
+volume temporarily and accept the model re-downloading.
+
+A 50GB Standard network volume (`a0szef22qu`) was created in US-GA-2 for this
+but has not yet been used in a successful deploy, since US-GA-2 had no RTX
+5090 stock at test time.
 
 ## Image
 
 Published: `ghcr.io/surejaj/ollama-tailscale:sha-6862842` (also tagged `latest`
-on `main`). Confirm visibility is set to Public (see note above) before relying
-on pulling it without a registry credential.
+on `main`) — **contains the `tailscale status` readiness bug above**, fixed in
+the entrypoint locally but not yet rebuilt/pushed as of this note. Confirm
+visibility is set to Public (see note above) before relying on pulling it
+without a registry credential.
 
 ## Not yet done
 
+- Push the entrypoint fix to `main` (needs a human — this session's git push
+  hit an SSH auth issue and the user opted to push manually) so CI rebuilds
+  the GHCR image with the readiness-check fix
 - Confirm the GHCR package visibility is set to Public (see note above — not automatic)
-- Create the actual network volume in US-GA-2
-- End-to-end `create-pod` run of the finished image with a real `TS_AUTHKEY` —
-  only the base `ollama/ollama:latest` image + HF pull step have been
-  live-tested so far, not the full entrypoint with Tailscale up/serve/ssh
+- Re-run the full end-to-end test with a fresh `TS_AUTHKEY` once the fixed
+  image is published — this has not yet succeeded through to a working
+  `tailscale serve` endpoint
+- Get RTX 5090 stock in a volume-compatible DC (US-GA-2 / EU-RO-1 / EUR-IS-1)
+  to validate the persistent-volume path specifically, separate from the
+  general entrypoint validation above

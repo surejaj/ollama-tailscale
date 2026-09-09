@@ -9,16 +9,20 @@ OLLAMA_CONTEXT_LENGTH="${OLLAMA_CONTEXT_LENGTH:-16384}"
 export OLLAMA_HOST="127.0.0.1:11434"
 export OLLAMA_CONTEXT_LENGTH
 
+TS_SOCKET=/var/run/tailscale/tailscaled.sock
 mkdir -p /var/lib/tailscale /var/run/tailscale
 
 echo "==> Starting tailscaled (userspace networking — RunPod pods aren't granted NET_ADMIN/TUN)"
 tailscaled \
   --tun=userspace-networking \
   --state=/var/lib/tailscale/tailscaled.state \
-  --socket=/var/run/tailscale/tailscaled.sock &
+  --socket="${TS_SOCKET}" &
 
+# `tailscale status` exits non-zero while logged out (NeedsLogin), by design —
+# it answers "are we connected", not "is the daemon up". So check for the
+# daemon's socket instead; it appears well before login state matters.
 for i in $(seq 1 30); do
-  tailscale --socket=/var/run/tailscale/tailscaled.sock status >/dev/null 2>&1 && break
+  [ -S "${TS_SOCKET}" ] && break
   if [ "$i" -eq 30 ]; then
     echo "FATAL: tailscaled did not become ready in time" >&2
     exit 1
@@ -27,7 +31,7 @@ for i in $(seq 1 30); do
 done
 
 echo "==> Authenticating to tailnet as ${TS_HOSTNAME}"
-if ! tailscale --socket=/var/run/tailscale/tailscaled.sock up \
+if ! tailscale --socket="${TS_SOCKET}" up \
     --authkey="${TS_AUTHKEY}" \
     --hostname="${TS_HOSTNAME}" \
     --ssh \
@@ -57,7 +61,7 @@ if ! ollama pull "${OLLAMA_MODEL}"; then
 fi
 
 echo "==> Exposing ollama over the tailnet via tailscale serve"
-if ! tailscale --socket=/var/run/tailscale/tailscaled.sock serve --bg --https=443 / http://127.0.0.1:11434; then
+if ! tailscale --socket="${TS_SOCKET}" serve --bg --https=443 / http://127.0.0.1:11434; then
   echo "FATAL: tailscale serve failed to configure" >&2
   exit 1
 fi
