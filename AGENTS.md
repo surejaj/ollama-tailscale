@@ -45,10 +45,17 @@ port in the pod config. `tailscale serve --bg --https=443` proxies from the
 tailnet interface to the loopback address, using Tailscale's own MagicDNS +
 HTTPS cert (already enabled on the tailnet this targets).
 
-**Debug access: `tailscale up --ssh`.**
-Lets you SSH into the running container over the tailnet
-(`ssh <hostname>.<tailnet>.ts.net`) without exposing any port — consistent
-with "everything through the tailnet, nothing public."
+**Debug access: no `tailscale ssh` — removed.**
+`tailscale up` originally passed `--ssh` to allow SSH into the running
+container over the tailnet without exposing any port. Dropped
+(2026-09-10) because every single boot logged the same health warning —
+`Tailscale SSH enabled, but access controls don't allow anyone to access
+this device. Ask your admin to update your tailnet's ACLs to allow
+access.` — meaning it was dead weight: enabled but unusable without an
+ACL change, and an unused open surface is worth removing rather than
+leaving half-configured. If SSH debug access is wanted later, it needs a
+deliberate tailnet ACL grant for this device/tag first, then `--ssh` can
+be re-added.
 
 **Tailscale networking mode: userspace (`tailscaled --tun=userspace-networking`).**
 RunPod's pod-create API has no field to grant `NET_ADMIN` or pass through

@@ -35,7 +35,6 @@ echo "==> Authenticating to tailnet as ${TS_HOSTNAME}"
 if ! tailscale --socket="${TS_SOCKET}" up \
     --authkey="${TS_AUTHKEY}" \
     --hostname="${TS_HOSTNAME}" \
-    --ssh \
     --accept-dns=true; then
   echo "FATAL: tailscale up failed — authkey is likely invalid, expired, or already consumed" >&2
   exit 1
