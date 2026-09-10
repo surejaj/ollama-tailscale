@@ -82,6 +82,15 @@ the entrypoint always calls it unconditionally rather than writing a custom
 existence check — cheap/fast on a warm volume, a real download only on a cold
 one. Without this, every pod restart would re-download ~25.7GB.
 
+**Correction (2026-09-10): container disk is wiped on every restart, not just
+`terminate`.** RunPod's own field description says as much ("Container disk in
+GB (ephemeral, wiped on restart)"), but this was initially misread as only
+applying to `terminate`. Confirmed live: after a pod-action `stop`+`start`
+(and separately after `restart`), the container came back with `total blobs:
+0` — the entire model had to redownload from scratch, not resume. **This
+means the network volume is not optional for surviving restarts** — without
+it mounted, every single restart re-downloads the full ~25.7GB, no exceptions.
+
 **Data center: US-GA-2.**
 Network volumes are pinned to one data center; pods can only mount a volume in
 the same DC. At the time of checking, only US-GA-2, EU-NL-1, and EUR-IS-3 had
@@ -149,13 +158,24 @@ package visibility to Public, matching the "public image" decision above.
   model blob completely. It then hit a transient HuggingFace timeout
   (`context deadline exceeded`) fetching a small ~931MB secondary blob —
   external flakiness, not an entrypoint bug — and exited via the fail-fast
-  path as designed. A `restart` (which preserves container disk, so the
-  already-downloaded 25GB blob and Tailscale state would carry over) was
-  attempted to resume the pull, but by then the ephemeral authkey had
-  expired, so `tailscale up` failed on the retry and the pod ended.
-  **`tailscale serve` and the final ready state have still not been
-  observed** — everything up to a completed model pull is confirmed working,
-  but the last step (exposing over the tailnet) remains unverified end-to-end.
+  path as designed. A `restart` was attempted to resume the pull (wrongly
+  assumed at the time to preserve container disk — see the correction
+  below), but by then the ephemeral authkey had expired, so `tailscale up`
+  failed on the retry and the pod ended.
+- 2026-09-10: fresh authkey, same image. `tailscale up` **succeeded** again
+  (confirmed the key is reusable, not single-use), `ollama serve` started,
+  and the pull hit the **exact same secondary blob** (`29fe388bf3a4`,
+  `sha256:f5a96332581f326b84ecf20412aaa17529e5ef6f3531f7f9a50ddbd81324c49a`)
+  with the identical `context deadline exceeded` timeout — **four times in a
+  row** across this session (once on the prior key, three times on this one,
+  including two full pod restarts). Always after the main 25GB blob
+  completes; always this one ~931MB file. This is conclusive: a persistent
+  problem with that specific blob on HuggingFace's CDN, not transient
+  flakiness. **`tailscale serve` and the final ready state remain
+  unverified** — every attempt has died at the model-pull step before
+  reaching it. Next step should be trying a different Unsloth quant tag
+  (e.g. `Q6_K` instead of `UD-Q6_K_XL` — different blob composition, likely
+  avoids this file) rather than continuing to retry the same pull.
 
 ## Bugs found in testing
 
@@ -224,12 +244,19 @@ case the API adds support later) but is dead code today — don't rely on it.
 
 ## Not yet done
 
+- **Try a different Unsloth quant tag** (e.g. `Q6_K` instead of
+  `UD-Q6_K_XL`) — the current default's secondary blob has failed 4/4 times
+  with an identical HuggingFace timeout; a different quant has a different
+  blob composition and likely sidesteps this specific file entirely. Don't
+  keep retrying the same pull blindly.
 - Confirm the GHCR package visibility is set to Public (see note above — not automatic)
-- Re-run the full end-to-end test with a **fresh** `TS_AUTHKEY` — the previous
-  key expired mid-test after a transient HF download timeout forced a retry
-  (see Verified log above). Everything through a completed model pull is
-  confirmed; `tailscale serve` and the final ready state are still unverified
+- Once a pull actually completes, verify `tailscale serve` and the final
+  ready state — every attempt so far has died at the model-pull step before
+  reaching this, so it remains entirely unverified
 - Get RTX 5090 stock in a volume-compatible DC (US-GA-2 / EU-RO-1 / EUR-IS-1)
   to validate the persistent-volume path specifically, separate from the
   general entrypoint validation above — the 50GB volume (`a0szef22qu`) already
-  exists in US-GA-2 but has never been used in a successful deploy
+  exists in US-GA-2 but has never been used in a successful deploy. This also
+  matters more now that container disk is confirmed wiped on every restart —
+  without the volume, a flaky pull means starting the full 25.7GB download
+  over from zero each time
