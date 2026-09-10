@@ -83,6 +83,29 @@ disconnects, so the new node cleanly claims the same `TS_HOSTNAME` each time.
 This keeps the tailnet DNS name stable (what your local Ollama client config
 actually depends on) without needing to persist any state.
 
+**Correction (2026-09-10): the "old node auto-deregisters" assumption above is
+false in practice — it caused the `-N` hostname dedup suffix to climb.** Live
+pod `s9ccqq1j63ijos` showed up as `ollama-6000ada-5.rattlesnake-pauling.ts.net`,
+not `ollama-6000ada`. Tailscale only reuses a base hostname if *no other node*
+currently claims it; a node killed hard (pod `terminate`, process SIGKILL,
+`restart` mid-run) leaves a zombie registration behind until the control
+server notices it's disconnected, and in the meantime a fresh node's
+`--hostname=X` gets silently rewritten to `X-2`, `X-3`, `X-5`, … by the
+dedup logic. Since every pod run here is a fresh node identity, a zombie with
+the *same* base name is left behind on every terminated/restarted pod, and
+the suffix number grows by one each time. Fix implemented 2026-09-10 in
+`entrypoint.sh`: after `tailscale up` succeeds it checks whether its own
+actual HostName differs from `TS_HOSTNAME` (i.e. got a suffix), and if an
+optional `TS_ADMIN_AUTHKEY` env var (admin-capable, long-lived — distinct
+from the per-run ephemeral key) is set, calls the Tailnet Admin API
+(`GET`/`DELETE /api/v2/tailnet/nodes`) to delete other nodes whose `HostName`
+matches `TS_HOSTNAME` (a node's API `HostName` field is the *suffix-free*
+base name, which is what makes this matching reliable). The current node
+keeps its assigned `-N` suffix until the *next* boot — deletion only unblocks
+a *future* node from claiming the bare name. Without `TS_ADMIN_AUTHKEY` the
+block just logs what it would have done, and cleanup stays manual (admin
+console → Devices → delete the zombie).
+
 **Failure handling: fail fast, no retries.**
 If `TS_AUTHKEY` is missing/invalid/expired, or the model pull fails, the
 entrypoint exits non-zero immediately. This is a manually-launched pod, not an
@@ -138,7 +161,8 @@ credential setup (`create-registry`) entirely.
 | Var | Required | Default | Purpose |
 |---|---|---|---|
 | `TS_AUTHKEY` | Yes* | — (fails fast if unset) | Fresh ephemeral Tailscale auth key, generated per run. *Falls back to reading `RUNPOD_SECRET_TSAUTH_KEY` if `TS_AUTHKEY` itself isn't set in-container — but getting a RunPod account secret into either var via the REST `create-pod` API has NOT been made to work yet (see "RunPod secrets" below); as of now `TS_AUTHKEY` must be passed as a plain value via `env` |
-| `TS_HOSTNAME` | No | `ollama-5090` | Fixed tailnet hostname / MagicDNS name |
+| `TS_HOSTNAME` | No | `ollama-6000ada` | Fixed tailnet hostname / MagicDNS name. Note: a *new* node only gets the bare name if no other (stale, zombie) node is still registered under it — see below |
+| `TS_ADMIN_AUTHKEY` | No | — (optional) | Long-lived **admin-capable** Tailscale authkey. If set, the entrypoint uses the Admin API after `tailscale up` to delete stale nodes still claiming `TS_HOSTNAME` (the source of the `-N` dedup suffix), so the next boot claims the clean name. Not needed if you're happy deleting zombies by hand in the tailnet admin console |
 | `OLLAMA_MODEL` | No | `hf.co/unsloth/Qwen3.5-27B-GGUF:UD-Q6_K_XL` | Full pull string passed to `ollama pull` — not just a short name, so any HF GGUF repo/tag can be swapped in without touching the Dockerfile |
 | `OLLAMA_CONTEXT_LENGTH` | No | `16384` | Context window; see VRAM rationale above before raising |
 
