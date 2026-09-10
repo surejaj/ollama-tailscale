@@ -233,6 +233,60 @@ from stale device dedup) is printed by `tailscale serve` itself a few lines
 earlier. Fixed by dropping the fabricated URL from the Ready line entirely —
 it now just points at `tailscale serve`'s own output rather than guessing.
 
+**`OLLAMA_HOST=127.0.0.1:11434` (loopback bind) activates Ollama's own
+DNS-rebinding protection, which rejects every request proxied through
+`tailscale serve`.** Confirmed 2026-09-10 by reading Ollama's source
+(`server/routes.go`, main branch) after every request to the tailnet
+URL returned `403` in 23-65µs regardless of `OLLAMA_ORIGINS`, on
+completely fresh pods/images/tailnet-node-registrations (ruling out
+caching, stale nodes, and — initially suspected — tailnet ACLs).
+
+The actual mechanism, `allowedHostsMiddleware(s.addr)`:
+```go
+if addr, err := netip.ParseAddrPort(addr.String()); err == nil && !addr.Addr().IsLoopback() {
+    c.Next()  // bind address is NOT loopback → skip validation, allow everything
+    return
+}
+```
+It only enforces host validation when the listener is bound to
+loopback — exactly our `OLLAMA_HOST=127.0.0.1:11434` (deliberately
+loopback, see "Ollama bind + exposure" above). Once active,
+`allowedHost(host)` accepts only `host == "" || host == "localhost"`,
+`host == os.Hostname()` (the container's own hostname), or a
+`.localhost`/`.local`/`.internal` suffix. `tailscale serve` proxies
+`https://<name>.<tailnet>.ts.net` → `http://127.0.0.1:11434` but
+preserves the original Host header rather than rewriting it to
+`localhost`, so Ollama sees `Host: ollama-6000ada-4.rattlesnake-...
+ts.net`, matches none of the three allowances, and
+`c.AbortWithStatus(403)`s with no body.
+
+**`OLLAMA_ORIGINS` cannot fix this — it is never consulted by this
+code path.** It only feeds `corsConfig.AllowOrigins` in a separate CORS
+middleware (`r.Use(cors.New(corsConfig), allowedHostsMiddleware(s.addr))`)
+that governs the browser `Origin` header, not the raw `Host` header.
+Confirmed empirically too: `OLLAMA_ORIGINS=*` (true wildcard) was
+already active when the 403 persisted, and a broader explicit-hostname
+list (`*.ts.net`, bare hostnames with no scheme prefix) instead
+**crashed** `ollama serve` outright — a *separate* bug, that CORS
+library panics on any origin entry lacking a `http://`/`https://`/
+extension-scheme prefix (`panic: bad origin: origins must contain '*'
+or include http://,https://,...`). Caused one unplanned crash-loop
+restart this session; recovered by reverting to bare `OLLAMA_ORIGINS=*`.
+
+There is no environment variable that expands `allowedHost`'s list —
+it is fully hardcoded, zero env vars referenced. This is a genuine
+design conflict, not a config bug: the loopback bind was chosen
+specifically so nothing reaches Ollama except through `tailscale
+serve`, even if RunPod's own port config were ever misconfigured — but
+that same loopback bind is what triggers this rejection of
+`tailscale serve`'s un-rewritten Host header. Binding to `0.0.0.0`
+would side-step Ollama's check (non-loopback → skipped) but reopens
+exactly the exposure risk the loopback bind exists to prevent. The
+clean fix is a small local reverse proxy between `tailscale serve` and
+Ollama that rewrites the Host header to `localhost` before forwarding,
+keeping Ollama on loopback while satisfying its own check — not yet
+implemented, see "Not yet done".
+
 ## Live capacity constraints discovered during testing
 
 RTX 5090 stock is scarce enough (LOW everywhere, frequently zero in practice)
@@ -289,6 +343,16 @@ case the API adds support later) but is dead code today — don't rely on it.
 
 ## Not yet done
 
+- **Verify the `tailscale serve` → Ollama 403 fix live.** Implemented
+  2026-09-10 (see "Bugs found" above for root cause): `entrypoint.sh` now
+  runs a small local `nginx` (added to the Dockerfile as `nginx-light`)
+  on `127.0.0.1:8080` that proxies to Ollama on `127.0.0.1:11434` and
+  rewrites the Host header to `localhost`, satisfying
+  `allowedHostsMiddleware`'s hardcoded allowlist. `tailscale serve` now
+  targets the proxy instead of Ollama directly. Ollama itself stays on
+  loopback — the security property is preserved. Written but not yet
+  tested against a live pod; confirm the `/api/tags` 403 is actually
+  gone before considering this closed.
 - **Try a different Unsloth quant tag** (e.g. `Q6_K` instead of
   `UD-Q6_K_XL`) — the current default's secondary blob has failed 4/4 times
   with an identical HuggingFace timeout; a different quant has a different
