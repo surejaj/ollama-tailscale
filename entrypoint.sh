@@ -6,9 +6,11 @@ TS_AUTHKEY="${TS_AUTHKEY:-${RUNPOD_SECRET_TSAUTH_KEY:-}}"
 TS_HOSTNAME="${TS_HOSTNAME:-ollama-5090}"
 OLLAMA_MODEL="${OLLAMA_MODEL:-hf.co/unsloth/Qwen3.5-27B-GGUF:UD-Q6_K_XL}"
 OLLAMA_CONTEXT_LENGTH="${OLLAMA_CONTEXT_LENGTH:-16384}"
+OLLAMA_ORIGINS="${OLLAMA_ORIGINS:-*}"
 
 export OLLAMA_HOST="127.0.0.1:11434"
 export OLLAMA_CONTEXT_LENGTH
+export OLLAMA_ORIGINS
 
 TS_SOCKET=/var/run/tailscale/tailscaled.sock
 mkdir -p /var/lib/tailscale /var/run/tailscale
