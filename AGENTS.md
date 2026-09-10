@@ -30,11 +30,20 @@ Community Cloud) — the tag resolves and Ollama's HF passthrough pulls it
 correctly. Note the actual GGUF filename/tag is `UD-Q6_K_XL` (Unsloth-Dynamic
 prefix), not bare `Q6_K_XL`.
 
-**Context window: `OLLAMA_CONTEXT_LENGTH=16384` default.**
-The 27B model at Q6_K_XL is ~25.7GB; the RTX 5090 has 32GB VRAM, leaving ~6GB
-for KV cache + CUDA overhead. 16384 is a safe default within that headroom;
-pushing higher (e.g. 32K) is possible but untested — would need to be verified
-against real VRAM usage before trusting it.
+**Context window: `OLLAMA_CONTEXT_LENGTH=131072` default (raised 2026-09-10
+from 16384).** Live pod `s9ccqq1j63ijos` is actually on an **RTX 6000 Ada
+(48GB VRAM)**, not the RTX 5090 assumed when the 16384 default was chosen —
+`nvidia-smi`-equivalent log line confirmed `48640 MiB total, 48209 MiB free`
+at boot, with Q6_K_XL weights (~25.7GB) + CUDA overhead (~4.3GB) leaving
+**~29.8GB free for KV cache**. At ~256KB/token (fp16) for this 27B-class
+model, 128K context needs ~32GB KV — slightly over that free headroom, so
+this is untested/unverified against real VRAM usage and may OOM; if it does,
+fall back to ~96K (`98304`, ~24GB KV) which fits comfortably. The prior 64K
+(`65536`) was already confirmed working live via per-request `num_ctx`
+override before this default was raised. Re-verify against actual GPU/VRAM
+before trusting this on a different pod/GPU type — the RTX 5090 math (only
+~6GB free, 128K impossible) still applies if a pod ever lands on that GPU
+instead.
 
 **Ollama bind + exposure: loopback-only, via `tailscale serve`.**
 `OLLAMA_HOST=127.0.0.1:11434` so the only way to reach it is through the
