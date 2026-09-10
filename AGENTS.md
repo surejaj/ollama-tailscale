@@ -185,6 +185,15 @@ package visibility to Public, matching the "public image" decision above.
   itself, which then hit a **new bug** — see "Bugs found" below. `Q4_K_M` is
   lower quality than the intended `Q6_K_XL` target, so this isn't necessarily
   the long-term default, but it's a proven-working fallback for testing.
+- **2026-09-10: first full end-to-end success.** Same `qwen3.5:27b` pull,
+  combined with the `tailscale serve` argument fix (see "Bugs found" below).
+  Full chain worked: `tailscale up` → `ollama serve` → model pull → `tailscale
+  serve` → TLS cert issued via ACME → live at
+  `https://ollama-5090-5.rattlesnake-pauling.ts.net/`. Pod `ds2zcwgsih8kzr`,
+  left running (not terminated) since it's a real usable instance. Still on
+  Q4_K_M (not the intended Q6_K_XL — see the HF blob issue above) and no
+  network volume attached, so a restart will re-download from scratch and
+  need a fresh `TS_AUTHKEY`.
 
 ## Bugs found in testing
 
@@ -208,6 +217,14 @@ fail-fast and exiting the container. Fixed by dropping the stray `/`:
 `tailscale serve --bg --https=443 http://127.0.0.1:11434`. Caught 2026-09-10
 on the first pull that ever completed successfully (`qwen3.5:27b`), so this
 was likely present (but unreached) in every earlier attempt too.
+
+**Final `"==> Ready:"` log line printed a fabricated URL.** It hardcoded
+`https://${TS_HOSTNAME}.<your-tailnet>.ts.net` — a placeholder, not the real
+resolved hostname. The actual live URL (e.g.
+`https://ollama-5090-5.rattlesnake-pauling.ts.net/`, note the `-5` suffix
+from stale device dedup) is printed by `tailscale serve` itself a few lines
+earlier. Fixed by dropping the fabricated URL from the Ready line entirely —
+it now just points at `tailscale serve`'s own output rather than guessing.
 
 ## Live capacity constraints discovered during testing
 

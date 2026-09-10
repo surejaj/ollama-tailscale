@@ -67,6 +67,6 @@ if ! tailscale --socket="${TS_SOCKET}" serve --bg --https=443 http://127.0.0.1:1
   exit 1
 fi
 
-echo "==> Ready: https://${TS_HOSTNAME}.<your-tailnet>.ts.net (model: ${OLLAMA_MODEL}, ctx: ${OLLAMA_CONTEXT_LENGTH})"
+echo "==> Ready (model: ${OLLAMA_MODEL}, ctx: ${OLLAMA_CONTEXT_LENGTH}) — see the tailnet URL printed by 'tailscale serve' above"
 
 wait "${OLLAMA_PID}"
