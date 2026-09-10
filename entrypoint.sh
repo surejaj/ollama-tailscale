@@ -62,7 +62,7 @@ if ! ollama pull "${OLLAMA_MODEL}"; then
 fi
 
 echo "==> Exposing ollama over the tailnet via tailscale serve"
-if ! tailscale --socket="${TS_SOCKET}" serve --bg --https=443 / http://127.0.0.1:11434; then
+if ! tailscale --socket="${TS_SOCKET}" serve --bg --https=443 http://127.0.0.1:11434; then
   echo "FATAL: tailscale serve failed to configure" >&2
   exit 1
 fi

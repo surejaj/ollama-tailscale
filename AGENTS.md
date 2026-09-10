@@ -176,6 +176,15 @@ package visibility to Public, matching the "public image" decision above.
   reaching it. Next step should be trying a different Unsloth quant tag
   (e.g. `Q6_K` instead of `UD-Q6_K_XL` — different blob composition, likely
   avoids this file) rather than continuing to retry the same pull.
+- 2026-09-10: tested `OLLAMA_MODEL=qwen3.5:27b` (Ollama's own official
+  library tag, Q4_K_M, ~17GB) instead of the HF Unsloth quant, specifically
+  to sidestep the broken blob. **The pull succeeded completely** — first
+  successful model pull in this whole test series, confirming the HF blob
+  really was the entire problem, not something wrong with Ollama/the pod/the
+  network. This pushed further than ever before, into `tailscale serve`
+  itself, which then hit a **new bug** — see "Bugs found" below. `Q4_K_M` is
+  lower quality than the intended `Q6_K_XL` target, so this isn't necessarily
+  the long-term default, but it's a proven-working fallback for testing.
 
 ## Bugs found in testing
 
@@ -187,6 +196,18 @@ always timed out and exited before ever attempting authentication, even though
 the daemon was healthy. Fixed by checking for the daemon's Unix socket file
 (`/var/run/tailscale/tailscaled.sock`) existing instead — that appears as soon
 as `tailscaled` binds it, well before login state is relevant.
+
+**`tailscale serve` command had a stray positional argument.** The entrypoint
+ran `tailscale serve --bg --https=443 / http://127.0.0.1:11434` — the bare
+`/` before the target URL. Current `tailscale serve` syntax takes exactly one
+positional argument (the target); serving at the root path is the default
+and doesn't need to be stated, path mounting is instead done via
+`--set-path=/foo` for a *non*-root path. The extra `/` argument caused
+`Error: invalid argument format` and the command exit(1)'d, tripping our own
+fail-fast and exiting the container. Fixed by dropping the stray `/`:
+`tailscale serve --bg --https=443 http://127.0.0.1:11434`. Caught 2026-09-10
+on the first pull that ever completed successfully (`qwen3.5:27b`), so this
+was likely present (but unreached) in every earlier attempt too.
 
 ## Live capacity constraints discovered during testing
 
