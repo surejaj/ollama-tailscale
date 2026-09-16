@@ -69,6 +69,30 @@ Ollama loads lazily, so reaching `Ready` does not confirm the model fit in
 VRAM at a given `num_ctx`. Issue a real generation request at the target
 context length and check VRAM before trusting 131072 on this model.
 
+**KV cache: quantized to `q8_0`, not offloaded to system RAM (2026-09-16).**
+The obvious idea for a 48GB card with 96GB of host RAM is to spill the KV cache
+to RAM and buy a much larger context. Rejected. The underlying llama.cpp flag is
+`-nkvo`; Ollama exposes it only as an undocumented `OLLAMA_NO_KV_OFFLOAD=1` that
+reportedly fails under `OLLAMA_NEW_ENGINE=1`, the PR to add it properly was
+pushed back on by maintainers, and the upstream issue is still open. Even when it
+works it round-trips KV over PCIe per token, which trades a throughput collapse
+for context. Host RAM does not help inference speed here — only loading.
+
+Quantizing the cache gets the same outcome without leaving VRAM: `q8_0` halves
+KV memory for a perplexity cost benchmarked at ~0.002–0.05. With ~17GB of
+weights, that is roughly 12GB of KV at 98304 instead of ~24GB, which is what
+makes the `131072` default plausible rather than aspirational. `OLLAMA_NUM_PARALLEL`
+is pinned to 1 in the same change — left on auto it silently divides the context
+across slots.
+
+**Unverified.** These numbers use the ~256KB/token estimate from the context
+section above, which has never been checked against real VRAM, and the flash
+attention fallback is silent. The entrypoint now issues a 1-token warm-up
+generation after `tailscale serve` comes up, purely to force the model load and
+full KV allocation into the boot log, followed by `ollama ps` — anything under
+100% GPU there means layers spilled to CPU. Read that line before trusting a
+large context on a new GPU type.
+
 **Ollama bind + exposure: loopback-only, via `tailscale serve`.**
 `OLLAMA_HOST=127.0.0.1:11434` so the only way to reach it is through the
 tailnet. RunPod also supports exposing ports publicly, which would silently
@@ -198,7 +222,9 @@ credential setup (`create-registry`) entirely.
 | `TS_HOSTNAME` | No | `ollama-6000ada` | Fixed tailnet hostname / MagicDNS name. Note: a *new* node only gets the bare name if no other (stale, zombie) node is still registered under it — see below |
 | `TS_ADMIN_AUTHKEY` | No | — (optional) | Long-lived **admin-capable** Tailscale authkey. If set, the entrypoint uses the Admin API after `tailscale up` to delete stale nodes still claiming `TS_HOSTNAME` (the source of the `-N` dedup suffix), so the next boot claims the clean name. Not needed if you're happy deleting zombies by hand in the tailnet admin console |
 | `OLLAMA_MODEL` | No | `qwen3.8:27b` | Full pull string passed to `ollama pull`, so it accepts either an Ollama-library tag (the default) or a full `hf.co/...` HF GGUF repo/tag, swappable without touching the Dockerfile. Changed from `hf.co/unsloth/Qwen3.5-27B-GGUF:UD-Q6_K_XL` on 2026-09-16 — see "Default model" above for why |
-| `OLLAMA_CONTEXT_LENGTH` | No | `16384` | Context window; see VRAM rationale above before raising |
+| `OLLAMA_CONTEXT_LENGTH` | No | `131072` | Context window; see VRAM rationale above before raising. (This row previously read `16384`, which had been stale since the 2026-09-10 raise — `entrypoint.sh` has said `131072` since then) |
+| `OLLAMA_KV_CACHE_TYPE` | No | `q8_0` | KV cache quantization. Halves KV memory vs the `f16` default for ~0.002–0.05 perplexity, which is what makes 128K context fit in 48GB. Requires flash attention (auto-enabled where supported); on an unsupported architecture Ollama **silently falls back to f16** and doubles KV usage, so confirm with `ollama ps` rather than assuming. `f16` to disable, `q4_0` to quarter it at a real quality cost |
+| `OLLAMA_NUM_PARALLEL` | No | `1` | Parallel request slots. Ollama divides `OLLAMA_CONTEXT_LENGTH` across slots and auto-picks the count from available memory, so leaving it on auto can silently multiply KV allocation or hand each request a fraction of the configured context. Pinned to 1 because this is a single-user endpoint |
 
 ## Files
 

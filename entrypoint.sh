@@ -18,10 +18,24 @@ TS_ADMIN_AUTHKEY="${TS_ADMIN_AUTHKEY:-${RUNPOD_SECRET_TSADMINAUTH_KEY:-}}"
 OLLAMA_MODEL="${OLLAMA_MODEL:-qwen3.8:27b}"
 OLLAMA_CONTEXT_LENGTH="${OLLAMA_CONTEXT_LENGTH:-131072}"
 OLLAMA_ORIGINS="${OLLAMA_ORIGINS:-*}"
+# Halves KV cache memory vs the fp16 default (perplexity cost ~0.002-0.05), which
+# is what makes a 128K context fit in 48GB alongside ~17GB of weights. Requires
+# flash attention — auto-enabled where the backend supports it. WARNING: on an
+# architecture that doesn't support it, Ollama silently falls back to fp16 and
+# doubles KV usage, so verify with `ollama ps` (expect 100% GPU) before trusting
+# a large context. Set to f16 to disable.
+OLLAMA_KV_CACHE_TYPE="${OLLAMA_KV_CACHE_TYPE:-q8_0}"
+# Ollama splits OLLAMA_CONTEXT_LENGTH across parallel slots and auto-picks the
+# slot count from available memory. Left on auto, a pod can silently allocate
+# several times the expected KV, or hand each request a fraction of the context
+# configured above. This is a single-user tailnet endpoint, so pin it to 1.
+OLLAMA_NUM_PARALLEL="${OLLAMA_NUM_PARALLEL:-1}"
 
 export OLLAMA_HOST="127.0.0.1:11434"
 export OLLAMA_CONTEXT_LENGTH
 export OLLAMA_ORIGINS
+export OLLAMA_KV_CACHE_TYPE
+export OLLAMA_NUM_PARALLEL
 
 TS_SOCKET=/var/run/tailscale/tailscaled.sock
 mkdir -p /var/lib/tailscale /var/run/tailscale
@@ -151,6 +165,20 @@ if ! tailscale --socket="${TS_SOCKET}" serve --bg --https=443 "http://127.0.0.1:
   exit 1
 fi
 
-echo "==> Ready (model: ${OLLAMA_MODEL}, ctx: ${OLLAMA_CONTEXT_LENGTH}) — see the tailnet URL printed by 'tailscale serve' above"
+echo "==> Ready (model: ${OLLAMA_MODEL}, ctx: ${OLLAMA_CONTEXT_LENGTH}, kv: ${OLLAMA_KV_CACHE_TYPE}, parallel: ${OLLAMA_NUM_PARALLEL}) — see the tailnet URL printed by 'tailscale serve' above"
+# Ollama loads lazily, so none of the above proves the model actually fit in VRAM
+# at this context length — that only happens on the first real request. Force it
+# now with a 1-token generation so a bad fit surfaces here in the boot log rather
+# than on the user's first prompt. Loading honours OLLAMA_CONTEXT_LENGTH, so this
+# allocates the full KV cache. Non-fatal: a failure here is worth seeing, but the
+# server is already serving and shouldn't be torn down over a warm-up.
+echo "==> Warming up (forces model load + full KV allocation)"
+curl -fsS --max-time 300 http://127.0.0.1:11434/api/generate \
+  -d "{\"model\":\"${OLLAMA_MODEL}\",\"prompt\":\"hi\",\"stream\":false,\"options\":{\"num_predict\":1}}" \
+  >/dev/null || echo "WARN: warm-up request failed — check VRAM fit at ctx ${OLLAMA_CONTEXT_LENGTH}" >&2
+# Anything less than 100% GPU means layers spilled to CPU, most likely because
+# the KV cache quantization silently fell back to fp16 on an unsupported arch.
+echo "==> VRAM/offload split (expect 100% GPU):"
+ollama ps || true
 
 wait "${OLLAMA_PID}"
