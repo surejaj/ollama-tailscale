@@ -11,7 +11,11 @@ TS_HOSTNAME="${TS_HOSTNAME:-ollama-6000ada}"
 # automatically after `tailscale up`; without it they must be removed by hand
 # in the tailnet admin console.
 TS_ADMIN_AUTHKEY="${TS_ADMIN_AUTHKEY:-${RUNPOD_SECRET_TSADMINAUTH_KEY:-}}"
-OLLAMA_MODEL="${OLLAMA_MODEL:-hf.co/unsloth/Qwen3.5-27B-GGUF:UD-Q6_K_XL}"
+# Ollama-library tag, not the hf.co/unsloth/Qwen3.5-27B-GGUF:UD-Q6_K_XL quant
+# originally intended: that HF pull failed 4/4 times on the same blob timeout.
+# Lower-precision quant, deliberately traded for a pull that terminates. Accepts
+# a full hf.co/... string too, so it can be pointed back if the passthrough is fixed.
+OLLAMA_MODEL="${OLLAMA_MODEL:-qwen3.8:27b}"
 OLLAMA_CONTEXT_LENGTH="${OLLAMA_CONTEXT_LENGTH:-131072}"
 OLLAMA_ORIGINS="${OLLAMA_ORIGINS:-*}"
 

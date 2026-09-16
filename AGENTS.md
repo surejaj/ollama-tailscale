@@ -12,23 +12,37 @@ without needing SSH/file-transfer tooling RunPod doesn't provide.
 ## Decisions and why
 
 **Serving engine: Ollama, not vLLM.**
-The default model quant (Q6_K_XL) is an Unsloth "dynamic quant" GGUF naming
-convention, consumed by llama.cpp-based runtimes. Ollama runs on llama.cpp and
-has first-class support for these exact files. vLLM's GGUF support is limited/
-experimental and built around AWQ/GPTQ/FP8 instead — fighting the framework to
-force Q6_K_XL through it isn't worth it, especially for a single-user tailnet
-endpoint where vLLM's concurrent-throughput advantage doesn't apply.
+Every model this project serves is a GGUF, consumed by llama.cpp-based
+runtimes — whether pulled from Ollama's own library or passed through from a
+HuggingFace repo. Ollama runs on llama.cpp and has first-class support for
+these files. vLLM's GGUF support is limited/experimental and built around
+AWQ/GPTQ/FP8 instead — fighting the framework to force a GGUF through it isn't
+worth it, especially for a single-user tailnet endpoint where vLLM's
+concurrent-throughput advantage doesn't apply. This reasoning originally
+referenced Unsloth's `Q6_K_XL` "dynamic quant" specifically; it holds equally
+for the Ollama-library tag that replaced it as the default (see below).
 
 **Base image: `FROM ollama/ollama:latest`.**
 Already bundles everything needed for NVIDIA GPU inference (auto-detects CUDA via
 the NVIDIA container runtime RunPod provides) — Tailscale is layered on top rather
 than assembling CUDA + Ollama from scratch.
 
-**Default model: `hf.co/unsloth/Qwen3.5-27B-GGUF:UD-Q6_K_XL`.**
-Confirmed live on 2026-09-09 by pulling it inside a real RunPod pod (RTX 5090,
-Community Cloud) — the tag resolves and Ollama's HF passthrough pulls it
-correctly. Note the actual GGUF filename/tag is `UD-Q6_K_XL` (Unsloth-Dynamic
-prefix), not bare `Q6_K_XL`.
+**Default model: `qwen3.8:27b` (changed 2026-09-16 from
+`hf.co/unsloth/Qwen3.5-27B-GGUF:UD-Q6_K_XL`).**
+The Unsloth HF tag resolves and starts pulling, but its secondary blob failed
+**4/4 times** with an identical HuggingFace timeout and never once completed a
+pull end-to-end — see the dated log below. `qwen3.8:27b` is an Ollama-library
+tag that pulls in ~36s and has now booted cleanly on three separate pods, so
+the default is the thing that actually works rather than the thing originally
+intended. Confirmed again 2026-09-16 on pod `9f6obxrvg64bgz`: pull succeeded,
+`tailscale serve` came up, and `/v1/models` returns `qwen3.8:27b` over the
+tailnet.
+
+The tradeoff is quantization quality. The Unsloth target was `Q6_K_XL`; the
+library tag is a lower-precision quant, so output quality is below what the
+original choice aimed for. That is a deliberate trade of quality for a pull
+that terminates. If the HF passthrough is ever fixed, revisit — `OLLAMA_MODEL`
+still takes a full HF pull string, so switching back needs no image change.
 
 **Context window: `OLLAMA_CONTEXT_LENGTH=131072` default (raised 2026-09-10
 from 16384).** Live pod `s9ccqq1j63ijos` is actually on an **RTX 6000 Ada
@@ -44,6 +58,16 @@ override before this default was raised. Re-verify against actual GPU/VRAM
 before trusting this on a different pod/GPU type — the RTX 5090 math (only
 ~6GB free, 128K impossible) still applies if a pod ever lands on that GPU
 instead.
+
+**Update 2026-09-16: the weights figure above is stale now that the default
+model changed.** The ~25.7GB is `Q6_K_XL`, which was never successfully
+pulled. The `qwen3.8:27b` blobs actually pulled on pod `9f6obxrvg64bgz` are
+~16GB + ~931MB ≈ **~17GB**, roughly 9GB lighter than the old math assumed —
+so on a 48GB card there is ~27GB free for KV rather than ~18GB, and 128K
+context is likely to fit where it previously would not have. Not yet proven:
+Ollama loads lazily, so reaching `Ready` does not confirm the model fit in
+VRAM at a given `num_ctx`. Issue a real generation request at the target
+context length and check VRAM before trusting 131072 on this model.
 
 **Ollama bind + exposure: loopback-only, via `tailscale serve`.**
 `OLLAMA_HOST=127.0.0.1:11434` so the only way to reach it is through the
@@ -138,8 +162,18 @@ for US-based proximity. GPU stock is live and can shift; re-check with
 `list-gpu-types`/`list-data-centers` (include=AVAILABILITY) before assuming
 this still holds.
 
-**Deployment style: ad-hoc `create-pod` calls, not a saved RunPod Template.**
-No pre-baked template — each deploy specifies image/GPU/env/volume directly.
+**Deployment style: ad-hoc `create-pod` calls, but the `TS_AUTHKEY` secret now
+lives on a saved RunPod Template.** A console-created template
+(`fnyf5iwd32`, name `ollama-tailscale-qwen38`, image
+`ghcr.io/surejaj/ollama-tailscale:latest`) defines
+`TS_AUTHKEY: {{ RUNPOD_SECRET_TSAUTH_KEY-1 }}`, referencing the RunPod
+account secret. This resolves correctly when the pod is deployed via this
+template — it's only the REST API's `create-pod`/`create-template` calls
+that can't resolve `{{ RUNPOD_SECRET_... }}` themselves (see the correction
+below). GPU/disk/volume are still specified ad-hoc at deploy time; only the
+authkey injection moved to the template. Note the template's `disk` is
+currently `32` GB, not the `20` GB documented below under "Container disk" —
+unreconciled, check which value actually applies before assuming 20GB.
 
 **Ports: zero exposed on the RunPod pod config.**
 Tailscale serve and Tailscale SSH are both outbound-initiated (via DERP relay/
@@ -160,10 +194,10 @@ credential setup (`create-registry`) entirely.
 
 | Var | Required | Default | Purpose |
 |---|---|---|---|
-| `TS_AUTHKEY` | Yes* | — (fails fast if unset) | Fresh ephemeral Tailscale auth key, generated per run. *Falls back to reading `RUNPOD_SECRET_TSAUTH_KEY` if `TS_AUTHKEY` itself isn't set in-container — but getting a RunPod account secret into either var via the REST `create-pod` API has NOT been made to work yet (see "RunPod secrets" below); as of now `TS_AUTHKEY` must be passed as a plain value via `env` |
+| `TS_AUTHKEY` | Yes | — (fails fast if unset) | Tailscale auth key. Now defined on the saved pod template `fnyf5iwd32` as `{{ RUNPOD_SECRET_TSAUTH_KEY-1 }}`, referencing the RunPod account secret — no longer needs to be passed as a plain value per `create-pod` call, as long as the pod is deployed from that template. |
 | `TS_HOSTNAME` | No | `ollama-6000ada` | Fixed tailnet hostname / MagicDNS name. Note: a *new* node only gets the bare name if no other (stale, zombie) node is still registered under it — see below |
 | `TS_ADMIN_AUTHKEY` | No | — (optional) | Long-lived **admin-capable** Tailscale authkey. If set, the entrypoint uses the Admin API after `tailscale up` to delete stale nodes still claiming `TS_HOSTNAME` (the source of the `-N` dedup suffix), so the next boot claims the clean name. Not needed if you're happy deleting zombies by hand in the tailnet admin console |
-| `OLLAMA_MODEL` | No | `hf.co/unsloth/Qwen3.5-27B-GGUF:UD-Q6_K_XL` | Full pull string passed to `ollama pull` — not just a short name, so any HF GGUF repo/tag can be swapped in without touching the Dockerfile |
+| `OLLAMA_MODEL` | No | `qwen3.8:27b` | Full pull string passed to `ollama pull`, so it accepts either an Ollama-library tag (the default) or a full `hf.co/...` HF GGUF repo/tag, swappable without touching the Dockerfile. Changed from `hf.co/unsloth/Qwen3.5-27B-GGUF:UD-Q6_K_XL` on 2026-09-16 — see "Default model" above for why |
 | `OLLAMA_CONTEXT_LENGTH` | No | `16384` | Context window; see VRAM rationale above before raising |
 
 ## Files
@@ -234,6 +268,39 @@ package visibility to Public, matching the "public image" decision above.
   Q4_K_M (not the intended Q6_K_XL — see the HF blob issue above) and no
   network volume attached, so a restart will re-download from scratch and
   need a fresh `TS_AUTHKEY`.
+- **2026-09-15: first live deploy via the saved template (`fnyf5iwd32`),
+  RTX 6000 Ada, pod `uathduuyqc6lb6` (US-WA-1, $0.84/hr Secure Cloud).**
+  Deployed with `OLLAMA_MODEL=qwen3.5:27b` (the proven-working tag) and
+  `OLLAMA_CONTEXT_LENGTH=98304`. Confirmed **the nginx Host-rewrite proxy
+  fix works live** — `GET /api/tags` returned `200`, not the previously
+  unverified 403 (see "Not yet done" — this item is now closed). Full
+  chain reached `tailscale serve` with a valid ACME cert at
+  `https://ollama-6000ada-3.rattlesnake-pauling.ts.net/`.
+  - Then switched the same pod to `OLLAMA_MODEL=qwen3.8:27b` (a
+    newer/untested tag, not the HF Unsloth blob that failed 4/4 times —
+    a different pull path) via `update-pod` with `templateId: fnyf5iwd32`
+    plus an explicit `env` override, keeping `OLLAMA_CONTEXT_LENGTH` and
+    re-resolving the templated `TS_AUTHKEY` secret correctly. **Discovery:
+    `update-pod`'s env PATCH triggers an automatic container restart on
+    its own** — no separate `pod-action restart` call was needed; the
+    entrypoint re-ran and re-pulled immediately. `qwen3.8:27b` pulled
+    successfully (~17GB across two blobs). No network volume attached, so
+    this restart wiped and redownloaded the model from scratch, and the
+    node claimed a new suffix, `ollama-6000ada-4.rattlesnake-pauling.ts.net`
+    (prior `-3` left a zombie registration, as expected — see the
+    `TS_HOSTNAME` dedup note above; `TS_ADMIN_AUTHKEY` is still not set on
+    this template).
+  - **API quirk found:** after this `update-pod` call, `get-pod`/`list-pods`
+    started persistently omitting `env`, `image`, `gpu`, `ssh`, and
+    `runtime` from their response for this pod (confirmed on 3+ separate
+    calls, several minutes apart) — despite the pod actually being healthy
+    and reachable (confirmed via direct log read and the user hitting the
+    live URL). Don't trust a sparse `get-pod` response as a sign the pod is
+    unhealthy; cross-check with `stream-pod-logs` or the live URL instead.
+  - **`stream-pod-logs` reliability:** repeatedly stalls past its
+    `maxWaitMs` and gets moved to a background task instead of returning —
+    happened 4 times this session, twice resolving only after an unrelated
+    `/mcp` reconnect. Don't assume a hang means the pod itself is stuck.
 
 ## Bugs found in testing
 
@@ -341,38 +408,9 @@ but has not yet been used in a successful deploy, since US-GA-2 had no RTX
 ## Image
 
 Current: `ghcr.io/surejaj/ollama-tailscale:sha-13dc1e3` (also tagged `latest`
-on `main`) — includes the readiness-check fix and the (currently-dead-code)
-RunPod-secret fallback. Confirm GHCR visibility is set to Public (see note
-above) before relying on pulling it without a registry credential.
-
-## RunPod secrets — confirmed NOT usable via the REST API
-
-Per RunPod's docs (docs.runpod.io/pods/templates/secrets), the templating
-syntax `{{ RUNPOD_SECRET_<name> }}` in an env var value is how you reference
-an account secret — but that page only documents it for the web console.
-Tried three ways to get the Tailscale authkey in via the account secret
-`TSAUTH_KEY` instead of a plaintext env var; all three failed on live pods:
-
-1. Assuming account secrets auto-inject as `RUNPOD_SECRET_<NAME>` env vars
-   into every pod automatically: **false** — the pod crash-looped with
-   `entrypoint.sh`'s "required" error every ~15-20s (RunPod auto-restarts a
-   pod whose container exits), meaning the env var was never present at all.
-2. Passing `env: {"TS_AUTHKEY": "{{ RUNPOD_SECRET_TSAUTH_KEY }}"}` directly
-   in an ad-hoc `create-pod` body: **false** — `tailscale up` ran with that
-   literal/unresolved value and Tailscale's control server rejected it with
-   "invalid key: unable to validate API key."
-3. Same env value, but defined on a saved Template (`create-template`) and
-   launched via `templateId` instead of ad-hoc, on the theory the docs'
-   "environment variables section of templates" phrasing meant it only
-   resolves for template-defined env vars: **also false** — identical
-   "invalid key: unable to validate API key" error.
-
-Conclusion: this templating syntax is web-console-only as of this test; the
-REST API (`create-pod`/`create-template`) does not resolve it under any
-combination tried. `TS_AUTHKEY` must be passed as its actual plain value in
-`env` on every `create-pod` call. The `RUNPOD_SECRET_TSAUTH_KEY` fallback
-left in `entrypoint.sh` is harmless (matches the docs' naming convention in
-case the API adds support later) but is dead code today — don't rely on it.
+on `main`) — includes the readiness-check fix. Confirm GHCR visibility is set
+to Public (see note above) before relying on pulling it without a registry
+credential.
 
 ## Not yet done
 
@@ -386,11 +424,14 @@ case the API adds support later) but is dead code today — don't rely on it.
   loopback — the security property is preserved. Written but not yet
   tested against a live pod; confirm the `/api/tags` 403 is actually
   gone before considering this closed.
-- **Try a different Unsloth quant tag** (e.g. `Q6_K` instead of
-  `UD-Q6_K_XL`) — the current default's secondary blob has failed 4/4 times
-  with an identical HuggingFace timeout; a different quant has a different
-  blob composition and likely sidesteps this specific file entirely. Don't
-  keep retrying the same pull blindly.
+- **Recover the intended quant quality.** No longer urgent — the default moved
+  to `qwen3.8:27b` on 2026-09-16, so nothing is blocked on the HF pull — but
+  the library tag is a lower-precision quant than the `Q6_K_XL` originally
+  targeted. If quality matters, try a different Unsloth quant tag (e.g.
+  `Q6_K` instead of `UD-Q6_K_XL`): the old default's secondary blob failed
+  4/4 times with an identical HuggingFace timeout, and a different quant has
+  a different blob composition, so it likely sidesteps that specific file.
+  Don't keep retrying the same pull blindly.
 - Confirm the GHCR package visibility is set to Public (see note above — not automatic)
 - Once a pull actually completes, verify `tailscale serve` and the final
   ready state — every attempt so far has died at the model-pull step before
