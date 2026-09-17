@@ -123,13 +123,43 @@ not via OS routing, so nothing else in the design changes. This wasn't a
 deliberate tradeoff discussion — it's the only mode that works given RunPod's
 API surface.
 
-**Tailscale identity: ephemeral, no state persistence, fixed hostname.**
-Each container run gets a *fresh* Tailscale auth key (ephemeral, generated
-externally per run) and a fresh node identity — no `tailscaled` state is
-persisted across restarts. The old ephemeral node auto-deregisters when it
-disconnects, so the new node cleanly claims the same `TS_HOSTNAME` each time.
-This keeps the tailnet DNS name stable (what your local Ollama client config
-actually depends on) without needing to persist any state.
+**Tailscale identity: ~~ephemeral~~ long-lived reusable key, no state
+persistence, fixed hostname.**
+Each container run gets a fresh node identity — no `tailscaled` state is
+persisted across restarts.
+
+~~Each container run gets a *fresh* Tailscale auth key (ephemeral, generated
+externally per run). The old ephemeral node auto-deregisters when it
+disconnects, so the new node cleanly claims the same `TS_HOSTNAME` each time.~~
+
+**Correction (2026-09-17): the key is NOT ephemeral, and is not generated per
+run.** Since the authkey moved into the RunPod account secret `TSAUTH_KEY-1`
+(see "Deployment style" below), a *single reusable* key is shared by every pod —
+it was used by three separate pods on 2026-09-16. Two consequences follow, and
+both were originally mis-attributed:
+
+1. **Nodes do not auto-deregister.** Observed on 2026-09-16/17: dead nodes sat
+   at `offline, last seen 3h ago` and only cleared overnight; a genuinely
+   ephemeral node is reaped minutes after disconnect. This — not the mechanism
+   guessed at in the 2026-09-10 correction below — is the root cause of the
+   `-N` suffix climbing (`-1` through `-5` observed in one day).
+2. **The key expires, and rotation is manual.** On 2026-09-17 pod
+   `bwge6vpgkvae5y` crash-looped with `invalid key: API key <id> not valid`
+   after working across three pods the previous day. Nothing in the stack
+   refreshes it; the secret must be updated by hand in the RunPod console
+   (the REST API cannot write account secrets).
+
+**Failure signature worth memorising:** an expired key makes the entrypoint
+fail fast, RunPod auto-restarts the container, and the pod **bills at full GPU
+rate while looping and never serving**. It registers no tailnet node, so
+`tailscale status` is empty and endpoint polling just times out — which looks
+exactly like a slow model pull. Check the container log for
+`FATAL: tailscale up failed` before assuming the pull is slow.
+
+**Fix for the hostname churn:** tick **Ephemeral** on the key (Tailscale then
+reaps nodes on disconnect, which is what this section originally assumed), and
+see the `TS_ADMIN_AUTHKEY` note below — whose cleanup code is currently
+unreachable.
 
 **Correction (2026-09-10): the "old node auto-deregisters" assumption above is
 false in practice — it caused the `-N` hostname dedup suffix to climb.** Live
@@ -141,18 +171,62 @@ server notices it's disconnected, and in the meantime a fresh node's
 `--hostname=X` gets silently rewritten to `X-2`, `X-3`, `X-5`, … by the
 dedup logic. Since every pod run here is a fresh node identity, a zombie with
 the *same* base name is left behind on every terminated/restarted pod, and
-the suffix number grows by one each time. Fix implemented 2026-09-10 in
-`entrypoint.sh`: after `tailscale up` succeeds it checks whether its own
-actual HostName differs from `TS_HOSTNAME` (i.e. got a suffix), and if an
-optional `TS_ADMIN_AUTHKEY` env var (admin-capable, long-lived — distinct
-from the per-run ephemeral key) is set, calls the Tailnet Admin API
-(`GET`/`DELETE /api/v2/tailnet/nodes`) to delete other nodes whose `HostName`
-matches `TS_HOSTNAME` (a node's API `HostName` field is the *suffix-free*
-base name, which is what makes this matching reliable). The current node
-keeps its assigned `-N` suffix until the *next* boot — deletion only unblocks
-a *future* node from claiming the bare name. Without `TS_ADMIN_AUTHKEY` the
-block just logs what it would have done, and cleanup stays manual (admin
-console → Devices → delete the zombie).
+the suffix number grows by one each time.
+
+**The 2026-09-10 "fix" never worked — rewritten 2026-09-17.** The original
+version ran *after* `tailscale up` and gated on
+`.Self.HostName != TS_HOSTNAME`. But `HostName` is the **suffix-free** base
+name, so that comparison is always false and the cleanup branch was
+**unreachable** — with or without `TS_ADMIN_AUTHKEY`. Confirmed live: the
+2026-09-16 boot that registered as `ollama-6000ada-2` logged
+`==> Live at hostname: ollama-6000ada`, which is the *else* branch. Three
+further bugs were latent in the unreachable code: the list URL
+(`/api/v2/tailnet/nodes`) and delete URL (`/api/v2/tailnet/nodes/{id}`) were
+both wrong, and the `jq` filter assumed a bare array with CLI-style
+capitalised fields.
+
+The rewrite:
+
+- **Reaps stale nodes *before* `tailscale up`**, not after. The suffix is
+  assigned at registration, so the zombie must be gone first — cleaning up
+  afterwards left the current boot stuck with its suffix and only helped the
+  next one. Any node holding `TS_HOSTNAME` before we register is stale by
+  definition, since every run is a fresh identity.
+- **Correct API** — `GET /api/v2/tailnet/-/devices` (`-` = default tailnet),
+  response `{"devices":[...]}` with lowercase `.id` / `.hostname`, and
+  `DELETE /api/v2/device/{id}`. Auth is HTTP basic, key as username, empty
+  password.
+- **Detects the suffix via `.Self.DNSName`** (first label), which carries the
+  real name, and emits a loud `WARN` when the granted name differs from
+  `TS_HOSTNAME` — because in that state clients pointed at `TS_HOSTNAME` will
+  silently fail to reach the pod.
+
+**Single-pod assumption:** the reap deletes *every* node matching
+`TS_HOSTNAME`, so two pods sharing a `TS_HOSTNAME` will fight. Give concurrent
+pods distinct hostnames.
+
+Without `TS_ADMIN_AUTHKEY` the reap is skipped with a log line, and cleanup
+stays manual (admin console → Devices → delete the zombie). Note that a
+properly **ephemeral** auth key largely removes the need for any of this —
+see the correction under "Tailscale identity" above.
+
+**Both keys expire — diary them.** As of 2026-09-17 there are two Tailscale
+credentials in RunPod account secrets, and nothing rotates either one:
+
+| Secret | Env var | Purpose | Expires |
+|---|---|---|---|
+| `TSAUTH_KEY-1` | `TS_AUTHKEY` | node registration (required) | rotated 2026-09-17; not ephemeral, so check its own TTL |
+| `TS_ADMIN_AUTHKEY` | `TS_ADMIN_AUTHKEY` | stale-node reap (optional) | **2026-12-16** (created 2026-09-17, 90-day max) |
+
+The two fail very differently, which is worth knowing before debugging one:
+
+- **`TS_AUTHKEY` expired → hard failure.** `tailscale up` fails, the entrypoint
+  exits, RunPod restarts the container, and the pod bills at full GPU rate in a
+  loop while serving nothing.
+- **`TS_ADMIN_AUTHKEY` expired → silent degradation.** `curl -sf` returns
+  nothing, the reap finds no stale nodes, boot continues normally — and the
+  `-N` suffix quietly comes back. The `WARN` on hostname mismatch after
+  `tailscale up` is the only signal, so watch for it.
 
 **Failure handling: fail fast, no retries.**
 If `TS_AUTHKEY` is missing/invalid/expired, or the model pull fails, the
@@ -218,9 +292,9 @@ credential setup (`create-registry`) entirely.
 
 | Var | Required | Default | Purpose |
 |---|---|---|---|
-| `TS_AUTHKEY` | Yes | — (fails fast if unset) | Tailscale auth key. Now defined on the saved pod template `fnyf5iwd32` as `{{ RUNPOD_SECRET_TSAUTH_KEY-1 }}`, referencing the RunPod account secret — no longer needs to be passed as a plain value per `create-pod` call, as long as the pod is deployed from that template. |
+| `TS_AUTHKEY` | Yes | — (fails fast if unset) | Tailscale auth key. Defined on the saved pod template `fnyf5iwd32` as `{{ RUNPOD_SECRET_TSAUTH_KEY-1 }}`, referencing the RunPod account secret — no longer needs to be passed as a plain value per `create-pod` call, as long as the pod is deployed from that template. **Not ephemeral and not per-run** (corrected 2026-09-17): one reusable key is shared by every pod, so dead nodes linger and the `-N` suffix climbs. It also **expires** — rotate it by hand in the RunPod console when `tailscale up` starts failing; see "Tailscale identity" above for the failure signature. |
 | `TS_HOSTNAME` | No | `ollama-6000ada` | Fixed tailnet hostname / MagicDNS name. Note: a *new* node only gets the bare name if no other (stale, zombie) node is still registered under it — see below |
-| `TS_ADMIN_AUTHKEY` | No | — (optional) | Long-lived **admin-capable** Tailscale authkey. If set, the entrypoint uses the Admin API after `tailscale up` to delete stale nodes still claiming `TS_HOSTNAME` (the source of the `-N` dedup suffix), so the next boot claims the clean name. Not needed if you're happy deleting zombies by hand in the tailnet admin console |
+| `TS_ADMIN_AUTHKEY` | No | — (optional) | Long-lived **admin-capable** Tailscale API key (`tskey-api-…`), distinct from `TS_AUTHKEY`. If set, the entrypoint deletes stale nodes claiming `TS_HOSTNAME` **before** `tailscale up`, so *this* boot claims the clean name (rewritten 2026-09-17; the previous after-the-fact version was unreachable dead code). Requires Owner/Admin/IT-admin rights. Now provided via the template as `{{ RUNPOD_SECRET_TS_ADMIN_AUTHKEY }}`. **Created 2026-09-17, expires 2026-12-16 (90 days)** — see the expiry note below. Not needed if you're happy deleting zombies by hand in the tailnet admin console |
 | `OLLAMA_MODEL` | No | `qwen3.8:27b` | Full pull string passed to `ollama pull`, so it accepts either an Ollama-library tag (the default) or a full `hf.co/...` HF GGUF repo/tag, swappable without touching the Dockerfile. Changed from `hf.co/unsloth/Qwen3.5-27B-GGUF:UD-Q6_K_XL` on 2026-09-16 — see "Default model" above for why |
 | `OLLAMA_CONTEXT_LENGTH` | No | `131072` | Context window; see VRAM rationale above before raising. (This row previously read `16384`, which had been stale since the 2026-09-10 raise — `entrypoint.sh` has said `131072` since then) |
 | `OLLAMA_KV_CACHE_TYPE` | No | `q8_0` | KV cache quantization. Halves KV memory vs the `f16` default for ~0.002–0.05 perplexity, which is what makes 128K context fit in 48GB. Requires flash attention (auto-enabled where supported); on an unsupported architecture Ollama **silently falls back to f16** and doubles KV usage, so confirm with `ollama ps` rather than assuming. `f16` to disable, `q4_0` to quarter it at a real quality cost |

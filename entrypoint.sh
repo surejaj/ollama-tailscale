@@ -58,6 +58,37 @@ for i in $(seq 1 30); do
   sleep 1
 done
 
+# Reap stale nodes BEFORE `tailscale up`, not after. Tailscale only appends a
+# dedup suffix (-2, -3, -5, …) when another node already holds the base name, so
+# the zombie has to be gone *before* we register — cleaning up afterwards leaves
+# this boot stuck with its suffix and only helps the next one. With no persisted
+# tailscaled state every run is a fresh identity, so any node still claiming
+# TS_HOSTNAME at this point is stale by definition.
+# Single-pod assumption: if a second pod is legitimately serving under the same
+# TS_HOSTNAME, this deletes it. Give concurrent pods distinct TS_HOSTNAMEs.
+if [ -n "${TS_ADMIN_AUTHKEY}" ]; then
+  echo "==> Reaping stale nodes claiming '${TS_HOSTNAME}' before registering"
+  # `-` means "the default tailnet for these credentials". API keys authenticate
+  # as HTTP basic with an empty password. The list response is {"devices":[...]}
+  # and its fields are lowercase (.id, .hostname) — unlike the CLI's status --json.
+  STALE_IDS=$(curl -sf -u "${TS_ADMIN_AUTHKEY}:" \
+    "https://api.tailscale.com/api/v2/tailnet/-/devices" | \
+    jq -r --arg host "${TS_HOSTNAME}" \
+    '.devices[] | select(.hostname == $host) | .id' || true)
+  if [ -n "${STALE_IDS}" ]; then
+    for STALE_ID in ${STALE_IDS}; do
+      echo "==> Deleting stale node ${STALE_ID}"
+      curl -sf -X DELETE -u "${TS_ADMIN_AUTHKEY}:" \
+        "https://api.tailscale.com/api/v2/device/${STALE_ID}" >/dev/null \
+        || echo "WARN: could not delete node ${STALE_ID}" >&2
+    done
+  else
+    echo "==> No stale nodes claiming '${TS_HOSTNAME}'"
+  fi
+else
+  echo "==> TS_ADMIN_AUTHKEY not set — skipping stale-node reap; expect a -N suffix if a zombie still holds '${TS_HOSTNAME}'"
+fi
+
 echo "==> Authenticating to tailnet as ${TS_HOSTNAME}"
 if ! tailscale --socket="${TS_SOCKET}" up \
     --authkey="${TS_AUTHKEY}" \
@@ -67,34 +98,16 @@ if ! tailscale --socket="${TS_SOCKET}" up \
   exit 1
 fi
 
-echo "==> Cleaning up stale same-hostname nodes (if an admin authkey is provided)"
-# Tailscale only appends a dedup suffix (-2, -3, -5, …) to the requested
-# hostname when some other node in this tailnet was registered earlier with
-# the same base name. With no persisted tailscaled state, every terminated pod
-# leaves a zombie node behind, so without cleanup the suffix number grows by
-# one on every new pod. Admin API note: a node's `HostName` field is the base
-# name *without* the suffix — that's why matching on it finds the stale
-# siblings (our own Name/DNSName carries the suffix, but HostName doesn't).
-ACTUAL_HOSTNAME=$(tailscale --socket="${TS_SOCKET}" status --json | jq -r '.Self.HostName')
-if [ -n "${TS_ADMIN_AUTHKEY}" ] && [ "${ACTUAL_HOSTNAME}" != "${TS_HOSTNAME}" ]; then
-  echo "==> Hostname came back as '${ACTUAL_HOSTNAME}' (requested '${TS_HOSTNAME}') — deleting stale nodes claiming it"
-  SELF_NODE_ID=$(tailscale --socket="${TS_SOCKET}" status --json | jq -r '.Self.NodeID')
-  STALE_NODE_IDS=$(curl -sf -H "Authorization: Bearer ${TS_ADMIN_AUTHKEY}" \
-    "https://api.tailscale.com/api/v2/tailnet/nodes" | \
-    jq -r --arg self "${SELF_NODE_ID}" --arg host "${TS_HOSTNAME}" \
-    '.[] | select((.ID|tostring) != $self and .HostName == $host) | .ID' || true)
-  if [ -n "${STALE_NODE_IDS}" ]; then
-    for STALE_ID in ${STALE_NODE_IDS}; do
-      echo "==> Deleting stale node ${STALE_ID}"
-      curl -sf -X DELETE -H "Authorization: Bearer ${TS_ADMIN_AUTHKEY}" \
-        "https://api.tailscale.com/api/v2/tailnet/nodes/${STALE_ID}" || true
-    done
-  else
-    echo "==> No live stale nodes found claiming '${TS_HOSTNAME}' — delete the zombie by hand in the admin console"
-  fi
-  echo "==> This node keeps its current suffix until the next boot; after the stale nodes above are gone, the next pod will claim '${TS_HOSTNAME}'"
+# Report the name actually granted. `.Self.HostName` is the *suffix-free* base
+# name and so always equals TS_HOSTNAME — comparing against it was the bug that
+# made the old cleanup branch unreachable. `.Self.DNSName` carries the real name
+# ("ollama-6000ada-3.<tailnet>.ts.net."), so take its first label.
+ACTUAL_NAME=$(tailscale --socket="${TS_SOCKET}" status --json | jq -r '.Self.DNSName' | cut -d. -f1)
+if [ "${ACTUAL_NAME}" != "${TS_HOSTNAME}" ]; then
+  echo "WARN: registered as '${ACTUAL_NAME}', not '${TS_HOSTNAME}' — another node still held the base name." >&2
+  echo "WARN: clients pointed at '${TS_HOSTNAME}' will NOT reach this pod. Set TS_ADMIN_AUTHKEY, or delete the zombie by hand." >&2
 else
-  echo "==> Live at hostname: ${ACTUAL_HOSTNAME}"
+  echo "==> Live at hostname: ${ACTUAL_NAME}"
 fi
 
 echo "==> Starting ollama serve"
